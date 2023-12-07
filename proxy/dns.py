@@ -39,7 +39,7 @@ if __name__ == "__main__":
     from proxy_server import start
 
     # Start the proxy server.
-    start(port=443, remote_address="https://www.google.com", ssl_proxy=True)
+    start(local_port=443, remote_address="https://www.google.com", ssl_proxy=True)
 
     # Start the DNS server, pretending google is on localhost.
     proxy = MITMDNSProxy()

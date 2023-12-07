@@ -1,64 +1,148 @@
-import OpenSSL
-from OpenSSL import crypto
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
 import os
 import atexit
+import datetime
 
+def create_root_cert() -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
+    if os.path.exists("root.crt") and os.path.exists("root.key"):
+        print("Root certificate already exists. Reading from file.")
 
-def create_root_cert():
-    # Create a key pair
-    root_key = crypto.PKey()
-    root_key.generate_key(crypto.TYPE_RSA, 2048)
+        with open("root.crt", "rb") as cert_file:
+            root_cert = x509.load_pem_x509_certificate(cert_file.read())
+
+        with open("root.key", "rb") as key_file:
+            root_key = serialization.load_pem_private_key(key_file.read(), password=None)
+
+        return root_cert, root_key
+
+    # Generate a private key
+    root_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
+
+    # Specify the subject for the root certificate
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, 'Root CA'),
+    ])
 
     # Create a self-signed root certificate
-    root_cert = crypto.X509()
-    root_cert.get_subject().CN = "Root CA"
-    root_cert.set_serial_number(1000)
-    root_cert.gmtime_adj_notBefore(0)
-    root_cert.gmtime_adj_notAfter(3650 * 24 * 60 * 60)  # 10 years validity
-    root_cert.set_issuer(root_cert.get_subject())
-    root_cert.set_pubkey(root_key)
-    root_cert.sign(root_key, "sha256")
+    root_cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow())
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None),
+            critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(digital_signature=True, content_commitment=True, key_encipherment=True, data_encipherment=True, key_agreement=True, key_cert_sign=True, crl_sign=True, encipher_only=False, decipher_only=False),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(root_key.public_key()),
+            critical=False,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
 
     # Save the root certificate and private key
     with open("root.crt", "wb") as cert_file:
-        cert_file.write(crypto.dump_certificate(crypto.FILETYPE_PEM, root_cert))
+        cert_file.write(root_cert.public_bytes(serialization.Encoding.PEM))
 
     with open("root.key", "wb") as key_file:
-        key_file.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, root_key))
+        key_file.write(root_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
 
     return root_cert, root_key
 
-def create_domain_cert(root_cert, root_key, domain_name):
-    # Create a key pair for the domain certificate
-    domain_key = crypto.PKey()
-    domain_key.generate_key(crypto.TYPE_RSA, 2048)
+def create_domain_cert(root_cert, root_key, domain_name) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
+    if os.path.exists(f"{domain_name}.crt") and os.path.exists(f"{domain_name}.key"):
+        print(f"Certificate for {domain_name} already exists. Reading from file.")
 
-    # Create a certificate signing request (CSR) for the domain
-    domain_csr = crypto.X509Req()
-    domain_csr.get_subject().CN = domain_name
-    domain_csr.set_pubkey(domain_key)
-    domain_csr.sign(domain_key, "sha256")
+        with open(f"{domain_name}.crt", "rb") as cert_file:
+            domain_cert = x509.load_pem_x509_certificate(cert_file.read())
+
+        with open(f"{domain_name}.key", "rb") as key_file:
+            domain_key = serialization.load_pem_private_key(key_file.read(), password=None)
+
+        return domain_cert, domain_key
+
+    # Generate a private key for the domain certificate
+    domain_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
+
+    # Specify the subject for the domain certificate
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, domain_name),
+    ])
 
     # Create a domain certificate signed by the root certificate
-    domain_cert = crypto.X509()
-    domain_cert.set_serial_number(1001)
-    domain_cert.gmtime_adj_notBefore(0)
-    domain_cert.gmtime_adj_notAfter(365 * 24 * 60 * 60)  # 1 year validity
-    domain_cert.set_issuer(root_cert.get_subject())
-    domain_cert.set_subject(domain_csr.get_subject())
-    domain_cert.set_pubkey(domain_csr.get_pubkey())
-    domain_cert.sign(root_key, "sha256")
+    san_entries = [x509.DNSName(domain_name)]
+    san_extension = x509.SubjectAlternativeName(san_entries)
+
+    domain_cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(root_cert.subject)
+        .public_key(domain_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow())
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(digital_signature=True,
+                content_commitment=True,
+                key_encipherment=True,
+                data_encipherment=True,
+                key_agreement=True,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH, x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH]),
+            critical=False,
+        )
+        .add_extension(
+            san_extension,
+            critical=False,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
 
     # Save the domain certificate and private key
     with open(f"{domain_name}.crt", "wb") as cert_file:
-        cert_file.write(crypto.dump_certificate(crypto.FILETYPE_PEM, domain_cert))
+        cert_file.write(domain_cert.public_bytes(serialization.Encoding.PEM))
 
     with open(f"{domain_name}.key", "wb") as key_file:
-        key_file.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, domain_key))
+        key_file.write(domain_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
 
     return domain_cert, domain_key
 
-def trust_certificate():
+def trust_root_certificate():
     # Check if current OS is Windows.
     if os.name == "nt":
         os.system(f"certutil -addstore -f root root.crt")
@@ -69,10 +153,9 @@ def trust_certificate():
         # TODO
         pass
 
-    atexit.register(untrust_certificate)
-
-
 def untrust_certificate():
+    print("Untrusting certificate...")
+    
     # Check if current OS is Windows.
     if os.name == "nt":
         os.system(f"certutil -delstore -f root root.crt")
